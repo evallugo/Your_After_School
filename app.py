@@ -1,23 +1,28 @@
 import io
 import re
+import os
+
 import pandas as pd
 import streamlit as st
 
-import os
+#first Streamlit command
+st.set_page_config(page_title="Packing List Generator", layout="centered")
+
+#password gate (set APP_PASSWORD as an environment variable) ----
 APP_PASSWORD = os.getenv("APP_PASSWORD")
 if APP_PASSWORD:
     pw = st.text_input("Password", type="password")
     if pw != APP_PASSWORD:
         st.stop()
 
-st.set_page_config(page_title="Packing List Generator", layout="centered")
 st.title("Packing List Generator")
 st.caption("Upload your bulk purchasing Excel file, confirm the columns, then download packing lists.")
 
 uploaded = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"])
 
-# ---------- helpers ----------
+#---------- helpers ----------
 def safe_sheet_name(name: str) -> str:
+    #Excel sheet names max 31 chars and cannot contain: : \ / ? * [ ]
     name = re.sub(r"[:\\/?*\[\]]", "-", str(name)).strip()
     return (name if name else "Sheet")[:31]
 
@@ -26,8 +31,8 @@ def normalize(s: str) -> str:
 
 def guess_col(columns, candidates):
     """
-    Return best-guess column based on normalized substring matches.
-    candidates: list of phrases to look for (normalized)
+    Best-guess a column based on normalized substring matches.
+    candidates: list[str] of phrases to look for (already "normalized-ish")
     """
     cols_norm = {c: normalize(c) for c in columns}
     for phrase in candidates:
@@ -36,12 +41,13 @@ def guess_col(columns, candidates):
                 return c
     return None
 
-def make_output_excel(df, class_col, lesson_col, item_col, qty_col, size_col=None, uom_col=None):
+def make_output_excel(df, class_col, lesson_col, item_col, qty_col, size_col=None, uom_col=None) -> bytes:
     df = df.dropna(subset=[class_col, lesson_col, item_col]).copy()
     df[qty_col] = pd.to_numeric(df[qty_col], errors="coerce").fillna(0)
 
     group_cols = [class_col, lesson_col, item_col]
     agg = {qty_col: "sum"}
+
     if size_col and size_col in df.columns:
         agg[size_col] = "first"
     if uom_col and uom_col in df.columns:
@@ -53,29 +59,39 @@ def make_output_excel(df, class_col, lesson_col, item_col, qty_col, size_col=Non
     index_rows = []
 
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        # INDEX tab
         for (class_name, lesson_name), g in df2.groupby([class_col, lesson_col]):
             sheet = safe_sheet_name(f"{class_name} - {lesson_name}")
 
             out_cols = [item_col, qty_col]
-            if size_col and size_col in g.columns: out_cols.append(size_col)
-            if uom_col and uom_col in g.columns: out_cols.append(uom_col)
+            if size_col and size_col in g.columns:
+                out_cols.append(size_col)
+            if uom_col and uom_col in g.columns:
+                out_cols.append(uom_col)
 
             out = g[out_cols].sort_values(by=item_col).rename(columns={
                 item_col: "Item",
                 qty_col: "Quantity",
-                size_col: "Size" if size_col else "Size",
-                uom_col: "Unit/Notes" if uom_col else "Unit/Notes",
             })
 
+            #nly rename optional columns if they exist
+            if size_col and size_col in out.columns:
+                out = out.rename(columns={size_col: "Size"})
+            if uom_col and uom_col in out.columns:
+                out = out.rename(columns={uom_col: "Unit/Notes"})
+
             out.to_excel(writer, sheet_name=sheet, index=False)
-            index_rows.append({"Class": class_name, "Lesson": lesson_name, "Sheet": sheet, "Items": len(out)})
+            index_rows.append({
+                "Class": class_name,
+                "Lesson": lesson_name,
+                "Sheet": sheet,
+                "Items": len(out)
+            })
 
         pd.DataFrame(index_rows).sort_values(["Class", "Lesson"]).to_excel(writer, sheet_name="INDEX", index=False)
 
     return output.getvalue()
 
-# ---------- app ----------
+#---------- app ----------
 if uploaded:
     file_bytes = uploaded.getvalue()
 
@@ -86,9 +102,9 @@ if uploaded:
         st.error(f"Could not read this as an Excel file. Details: {e}")
         st.stop()
 
-    # heuristic: prefer sheets with "master" / "purchase" / "bulk" in the name
+    #Heuristic: prefer sheets with "master" / "purchase" / "bulk" / etc. in the name
     preferred = None
-    for key in ["master", "purch", "bulk", "order", "list"]:
+    for key in ["master", "purch", "purchase", "bulk", "order", "list"]:
         for s in sheet_names:
             if key in normalize(s):
                 preferred = s
@@ -108,7 +124,7 @@ if uploaded:
         st.error(f"Could not read sheet '{sheet}'. Details: {e}")
         st.stop()
 
-    # drop completely empty columns (common in exports)
+    #Drop completely empty columns (common in exports)
     df = df.dropna(axis=1, how="all")
 
     if df.empty or len(df.columns) == 0:
@@ -120,41 +136,63 @@ if uploaded:
 
     cols = list(df.columns)
 
-    # smart guesses (works even if headers vary slightly)
+    #Smart guesses (works even if headers vary slightly)
     default_class = guess_col(cols, ["class", "course", "program"])
     default_lesson = guess_col(cols, ["lesson", "module", "unit", "activity"])
     default_item = guess_col(cols, ["item description", "item", "product", "material", "supply"])
-    # quantity can vary a lot: "per section total", "needed", "qty", "quantity"
     default_qty = guess_col(cols, ["per section total", "needed", "quantity", "qty", "total"])
 
     default_size = guess_col(cols, ["size"])
-    default_uom = guess_col(cols, ["unit of measure", "uom", "units", "unit"])
+    default_uom = guess_col(cols, ["unit of measure", "uom", "units", "unit", "notes"])
 
     col1, col2 = st.columns(2)
     with col1:
-        class_col = st.selectbox("Class column (required)", cols, index=cols.index(default_class) if default_class in cols else 0)
-        lesson_col = st.selectbox("Lesson column (required)", cols, index=cols.index(default_lesson) if default_lesson in cols else 0)
-        item_col = st.selectbox("Item column (required)", cols, index=cols.index(default_item) if default_item in cols else 0)
-        qty_col = st.selectbox("Quantity column (required)", cols, index=cols.index(default_qty) if default_qty in cols else 0)
-    with col2:
-        size_col = st.selectbox("Size column (optional)", ["(none)"] + cols,
-                                index=(["(none)"] + cols).index(default_size) if default_size in cols else 0)
-        uom_col = st.selectbox("Unit/Notes column (optional)", ["(none)"] + cols,
-                               index=(["(none)"] + cols).index(default_uom) if default_uom in cols else 0)
+        class_col = st.selectbox(
+            "Class column (required)",
+            cols,
+            index=cols.index(default_class) if default_class in cols else 0
+        )
+        lesson_col = st.selectbox(
+            "Lesson column (required)",
+            cols,
+            index=cols.index(default_lesson) if default_lesson in cols else 0
+        )
+        item_col = st.selectbox(
+            "Item column (required)",
+            cols,
+            index=cols.index(default_item) if default_item in cols else 0
+        )
+        qty_col = st.selectbox(
+            "Quantity column (required)",
+            cols,
+            index=cols.index(default_qty) if default_qty in cols else 0
+        )
 
-    # validate distinct required selections
+    with col2:
+        size_col = st.selectbox(
+            "Size column (optional)",
+            ["(none)"] + cols,
+            index=(["(none)"] + cols).index(default_size) if default_size in cols else 0
+        )
+        uom_col = st.selectbox(
+            "Unit/Notes column (optional)",
+            ["(none)"] + cols,
+            index=(["(none)"] + cols).index(default_uom) if default_uom in cols else 0
+        )
+
+    #Validate distinct required selections
     required = [class_col, lesson_col, item_col, qty_col]
     if len(set(required)) < 4:
         st.error("Your required column selections must be four different columns.")
         st.stop()
 
-    # optional → None
+    #Optional -> None
     size_col = None if size_col == "(none)" else size_col
     uom_col = None if uom_col == "(none)" else uom_col
 
     st.subheader("Step 2: Preview")
-    preview = df[[c for c in [class_col, lesson_col, item_col, qty_col, size_col, uom_col] if c is not None]].head(25)
-    st.dataframe(preview, use_container_width=True)
+    preview_cols = [c for c in [class_col, lesson_col, item_col, qty_col, size_col, uom_col] if c is not None]
+    st.dataframe(df[preview_cols].head(25), use_container_width=True)
 
     st.subheader("Step 3: Generate")
     if st.button("Generate Packing Lists"):
@@ -170,7 +208,7 @@ if uploaded:
             )
             st.success("Done! Your packing lists are ready.")
             st.download_button(
-                "Download Packing_Lists.xlsx",
+                label="Download Packing_Lists.xlsx",
                 data=result,
                 file_name="Packing_Lists.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
